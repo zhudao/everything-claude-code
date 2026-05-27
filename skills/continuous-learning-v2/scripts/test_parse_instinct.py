@@ -13,6 +13,7 @@ Covers:
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ _find_cross_project_instincts = _mod._find_cross_project_instincts
 load_registry = _mod.load_registry
 _validate_instinct_id = _mod._validate_instinct_id
 _update_registry = _mod._update_registry
+_confidence_bar = _mod._confidence_bar
 
 
 # ─────────────────────────────────────────────
@@ -483,6 +485,21 @@ def test_load_supports_md_extension(tmp_path):
     assert "test-instinct" in ids
 
 
+def test_load_instincts_from_dir_uses_utf8_encoding(tmp_path, monkeypatch):
+    yaml_file = tmp_path / "test.yaml"
+    yaml_file.write_text("placeholder")
+    calls = []
+
+    def fake_read_text(self, *args, **kwargs):
+        calls.append(kwargs.get("encoding"))
+        return SAMPLE_INSTINCT_YAML
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    result = _load_instincts_from_dir(tmp_path, "personal", "project")
+    assert result[0]["id"] == "test-instinct"
+    assert calls == ["utf-8"]
+
+
 # ─────────────────────────────────────────────
 # load_all_instincts tests
 # ─────────────────────────────────────────────
@@ -624,6 +641,39 @@ def test_cmd_status_with_instincts(patch_globals, monkeypatch, capsys):
     assert "Global instincts:  1" in out
     assert "PROJECT-SCOPED" in out
     assert "GLOBAL" in out
+
+
+def test_confidence_bar_uses_unicode_when_supported():
+    """Confidence bars should retain block glyphs on UTF-8 streams."""
+    stream = SimpleNamespace(encoding="utf-8")
+    assert _confidence_bar(0.8, stream=stream) == "\u2588" * 8 + "\u2591" * 2
+
+
+def test_confidence_bar_uses_ascii_when_stream_rejects_block_glyphs():
+    """Windows cp1252 streams cannot encode block glyphs."""
+    stream = SimpleNamespace(encoding="cp1252")
+    assert _confidence_bar(0.8, stream=stream) == "########.."
+
+
+def test_print_instincts_by_domain_is_cp1252_safe(monkeypatch):
+    """Status rendering should not crash on Windows cp1252 stdout."""
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(_mod.sys, "stdout", stream)
+
+    _mod._print_instincts_by_domain([{
+        "id": "windows-safe",
+        "trigger": "when stdout uses cp1252",
+        "confidence": 0.8,
+        "domain": "platform",
+        "scope": "project",
+    }])
+
+    stream.flush()
+    out = raw.getvalue().decode("cp1252")
+    assert "########.." in out
+    assert "\u2588" not in out
+    assert "\u2591" not in out
 
 
 def test_cmd_status_returns_int(patch_globals, monkeypatch):
@@ -938,6 +988,18 @@ def test_load_registry_valid(patch_globals):
     tree["registry_file"].write_text(json.dumps(data))
     result = load_registry()
     assert result == data
+
+
+def test_load_registry_uses_utf8_encoding(monkeypatch):
+    calls = []
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        calls.append(kwargs.get("encoding"))
+        return io.StringIO("{}")
+
+    monkeypatch.setattr(_mod, "open", fake_open, raising=False)
+    assert load_registry() == {}
+    assert calls == ["utf-8"]
 
 
 def test_validate_instinct_id():
