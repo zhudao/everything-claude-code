@@ -23,7 +23,7 @@ jobs:
           echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
           echo "✅ 上游仓库: $UPSTREAM"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
 
       - name: Sync with upstream (默认分支)
         run: |
@@ -33,4 +33,4 @@ jobs:
             --source ${{ steps.get-upstream.outputs.upstream }} \
             --force
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
