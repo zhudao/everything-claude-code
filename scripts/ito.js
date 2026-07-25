@@ -5,32 +5,46 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { createSafeItoEnvironment } = require("./lib/ito-environment");
+const {
+  createSafeItoInvocationEnvironment,
+  getInvocationCommand,
+} = require("./lib/ito-environment");
 
-const SUPPORTED_COMMANDS = Object.freeze(["auth", "find", "status"]);
+const SUPPORTED_COMMANDS = Object.freeze(["auth", "find", "status", "evals"]);
 const CANONICAL_REPOSITORY = "https://github.com/Ito-Markets/ito-cloud-runtime.git";
 const CANONICAL_PACKAGE_PATH = "cli/ito-compute-cli";
+const CANONICAL_ENTRY_SEGMENTS = Object.freeze([
+  ...CANONICAL_PACKAGE_PATH.split("/"),
+  "dist",
+  "bin",
+  "ito.js",
+]);
 const EXECUTABLE_OVERRIDE = "ECC_ITO_CLI_EXECUTABLE";
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+const NODE_QUALIFICATION_TIMEOUT_MS = 31 * 60 * 1000;
 
 function showHelp() {
-  console.log(`
+  process.stdout.write(`
 ECC × Itô local CLI bridge
 
 Usage:
   ecc ito auth
   ecc ito find <all required RFQ options>
   ecc ito status
-  ecc ito <auth|find|status> --json
+  ecc ito evals --cluster <id> --live-sixtytwo --nodes <list> --config-dir <dir>
+  ecc ito <auth|find|status|evals> --json
 
 The bridge invokes the separately installed canonical Itô CLI and returns its
 real stdout, stderr, and exit code unchanged. It performs no browser navigation
-and adds no lock, workload, inference, evaluation, or purchase path.
+and adds no lock, workload, inference, or purchase path.
 
 Important:
   - "find" reads live inventory and submits an authenticated RFQ.
   - Obtain explicit buyer authority and every hard constraint before invoking it.
   - "status" reads live RFQ and procurement status.
+  - "evals" invokes only the canonical CLI's double-opt-in, pinned
+    sixtytwo-cli node-qualification adapter against explicit nodes.
+  - Node qualification cannot rent, launch, recover, repair, or purchase.
   - Inventory and RFQs are not reservations; only a returned firm quote is firm.
 
 The canonical package is currently unpublished. Install it locally:
@@ -53,9 +67,65 @@ The same package's MCP server exposes only:
 Configure the MCP command as "node" with this absolute argument:
   /absolute/path/to/ito-cloud-runtime/${CANONICAL_PACKAGE_PATH}/dist/bin/ito-mcp.js
 
-Inject ITO_API_KEY into the child process from 1Password or the launching
-environment. Never put the key in arguments, tracked files, or chat.
+For auth, find, and status, inject ITO_API_KEY into the child process from
+1Password or the launching environment. Never put the key in arguments,
+tracked files, or chat.
+
+Live node qualification requires ITO_ENABLE_SIXTYTWO_LIVE=1,
+--live-sixtytwo, an explicit node list, and an existing absolute config
+directory. It forwards only named SIXTYTWO_API_TOKEN/SIXTYTWO_TOKEN and SSH
+agent state; ITO_API_KEY is intentionally excluded. The canonical CLI requires
+sixtytwo-cli==0.3.33 and fails closed.
 `);
+}
+
+function requiredOptionValue(args, option) {
+  const indexes = args
+    .map((value, index) => (value === option ? index : -1))
+    .filter((index) => index >= 0);
+  if (indexes.length !== 1) {
+    throw new Error(`${option} is required exactly once for live node qualification.`);
+  }
+  const value = args[indexes[0] + 1];
+  if (!value?.trim() || value.startsWith("--")) {
+    throw new Error(`${option} requires a non-empty value for live node qualification.`);
+  }
+  return value;
+}
+
+function validateNodeQualificationArgs(args, environment) {
+  if (environment.ITO_ENABLE_SIXTYTWO_LIVE !== "1") {
+    throw new Error(
+      "Live node qualification requires ITO_ENABLE_SIXTYTWO_LIVE=1 before any process is started."
+    );
+  }
+  if (args.filter((value) => value === "--live-sixtytwo").length !== 1) {
+    throw new Error(
+      "Live node qualification requires --live-sixtytwo exactly once before any process is started."
+    );
+  }
+  requiredOptionValue(args, "--cluster");
+  const nodes = requiredOptionValue(args, "--nodes");
+  if (!nodes.split(",").every((node) => node.trim().length > 0)) {
+    throw new Error("--nodes must explicitly list one or more non-empty nodes.");
+  }
+  const configDirectory = requiredOptionValue(args, "--config-dir");
+  if (!path.isAbsolute(configDirectory)) {
+    throw new Error("--config-dir must be an existing absolute directory.");
+  }
+  try {
+    const resolved = fs.realpathSync.native(configDirectory);
+    if (
+      !fs.statSync(resolved).isDirectory()
+      || !fs.statSync(path.join(resolved, "sixtytwo.yaml")).isFile()
+    ) {
+      throw new Error("invalid qualification configuration");
+    }
+  } catch {
+    throw new Error(
+      "--config-dir must exist and contain a regular sixtytwo.yaml before any process is started."
+    );
+  }
 }
 
 function parseArgs(argv, environment = process.env) {
@@ -84,8 +154,11 @@ function parseArgs(argv, environment = process.env) {
   const command = withoutJson.shift();
   if (!SUPPORTED_COMMANDS.includes(command)) {
     throw new Error(
-      `Unsupported Itô command "${command || "(missing)"}"; ECC permits only auth, find, and status.`
+      `Unsupported Itô command "${command || "(missing)"}"; ECC permits only auth, find, status, and evals.`
     );
+  }
+  if (command === "evals") {
+    validateNodeQualificationArgs(withoutJson, environment);
   }
 
   return Object.freeze({
@@ -127,6 +200,11 @@ function assertUsableExecutable(candidate) {
       `${EXECUTABLE_OVERRIDE} does not point to a readable local Itô CLI file.`
     );
   }
+  if (!isCanonicalItoEntry(canonicalCandidate)) {
+    throw new Error(
+      `${EXECUTABLE_OVERRIDE} must point to the canonical dist/bin/ito.js entry.`
+    );
+  }
   if (!isUsableExecutable(canonicalCandidate)) {
     throw new Error(
       `${EXECUTABLE_OVERRIDE} does not point to a readable local Itô CLI file.`
@@ -135,15 +213,26 @@ function assertUsableExecutable(candidate) {
   return canonicalCandidate;
 }
 
+function isCanonicalItoEntry(candidate) {
+  const pathSegments = path
+    .normalize(candidate)
+    .split(path.sep)
+    .filter(Boolean);
+  if (pathSegments.length < CANONICAL_ENTRY_SEGMENTS.length) return false;
+  const candidateTail = pathSegments.slice(-CANONICAL_ENTRY_SEGMENTS.length);
+  return candidateTail.every((segment, index) => {
+    const expected = CANONICAL_ENTRY_SEGMENTS[index];
+    return process.platform === "win32"
+      ? segment.toLowerCase() === expected.toLowerCase()
+      : segment === expected;
+  });
+}
+
 function isUsableExecutable(candidate) {
   try {
     const info = fs.statSync(candidate);
     if (!info.isFile()) return false;
-    if (process.platform !== "win32" && path.extname(candidate) !== ".js") {
-      fs.accessSync(candidate, fs.constants.X_OK);
-    } else {
-      fs.accessSync(candidate, fs.constants.R_OK);
-    }
+    fs.accessSync(candidate, fs.constants.R_OK);
     return true;
   } catch {
     return false;
@@ -151,32 +240,29 @@ function isUsableExecutable(candidate) {
 }
 
 function buildInvocation(executable, args) {
-  if (path.extname(executable).toLowerCase() === ".js") {
-    return Object.freeze({
-      executable: process.execPath,
-      args: Object.freeze([executable, ...args]),
-    });
-  }
-  if (
-    process.platform === "win32"
-    && /\.(?:bat|cmd|ps1)$/i.test(executable)
-  ) {
+  if (!isCanonicalItoEntry(executable)) {
     throw new Error(
-      `Refusing to invoke the Itô CLI through a shell shim. Set ${EXECUTABLE_OVERRIDE} to the absolute dist/bin/ito.js path.`
+      `Refusing to invoke an Itô CLI shim. Set ${EXECUTABLE_OVERRIDE} to the absolute dist/bin/ito.js path.`
     );
   }
-  return Object.freeze({ executable, args: Object.freeze([...args]) });
+  return Object.freeze({
+    executable: process.execPath,
+    args: Object.freeze([executable, ...args]),
+  });
 }
 
 function invokeIto(executable, args, environment = process.env) {
   const invocation = buildInvocation(executable, args);
+  const command = getInvocationCommand(args);
+  const isNodeQualification = command === "evals";
   const result = spawnSync(invocation.executable, invocation.args, {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: {
-      ...createSafeItoEnvironment(environment, { includeItoRuntime: true }),
-    },
+    // Keep policy helpers immutable for callers, but give child-process
+    // instrumentation its own mutable copy (for example NODE_V8_COVERAGE).
+    env: { ...createSafeItoInvocationEnvironment(environment, args) },
     maxBuffer: MAX_OUTPUT_BYTES,
+    timeout: isNodeQualification ? NODE_QUALIFICATION_TIMEOUT_MS : undefined,
     shell: false,
     windowsHide: true,
   });
@@ -216,6 +302,7 @@ module.exports = Object.freeze({
   CANONICAL_PACKAGE_PATH,
   CANONICAL_REPOSITORY,
   EXECUTABLE_OVERRIDE,
+  NODE_QUALIFICATION_TIMEOUT_MS,
   SUPPORTED_COMMANDS,
   buildInvocation,
   invokeIto,
