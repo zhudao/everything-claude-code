@@ -1101,6 +1101,21 @@ function isReadOnlyGitIntrospection(command) {
 
 // --- Gate messages ---
 
+/**
+ * Batch-consistency warning (#3136). A first-touch denial marks the file
+ * checked so the retry passes; a parallel batch of edits to one
+ * not-yet-touched file therefore partially applies (first call denied,
+ * siblings allowed). Hooks see calls one at a time and cannot lock a
+ * batch, so the denial must say this out loud: name the file and tell
+ * the agent that siblings may already have been applied.
+ */
+function batchSiblingWarning(safePath) {
+  return (
+    `If this call was sent in a parallel batch, other edits to ${safePath} from that batch ` +
+    'may already have been applied. Re-read the file before building on them.'
+  );
+}
+
 function editGateMsg(filePath) {
   const safe = sanitizePath(filePath);
   return [
@@ -1112,6 +1127,8 @@ function editGateMsg(filePath) {
     '2. List the public functions/classes affected by this change',
     '3. If this file reads/writes data files, show field names, structure, and date format (use redacted or synthetic values, not raw production data)',
     "4. Quote the user's current instruction verbatim",
+    '',
+    batchSiblingWarning(safe),
     '',
     'Present the facts, then retry the same operation.'
   ].join('\n');
@@ -1129,6 +1146,8 @@ function writeGateMsg(filePath) {
     '3. If this file reads/writes data files, show field names, structure, and date format (use redacted or synthetic values, not raw production data)',
     "4. Quote the user's current instruction verbatim",
     '',
+    batchSiblingWarning(safe),
+    '',
     'Present the facts, then retry the same operation.'
   ].join('\n');
 }
@@ -1143,6 +1162,7 @@ function condensedGateMsg(action, filePath, ordinal) {
   return (
     `[Fact-Forcing Gate] (denial #${ordinal} this session) First ${action} of ${safe}: ` +
     "briefly state importers/callers, affected API, data schemas if any, and the user's verbatim instruction, then retry. " +
+    `${batchSiblingWarning(safe)} ` +
     '(Use GATEGUARD_EXEMPT_GLOBS for path-scoped exemptions; ECC_GATEGUARD=off disables this gate.)'
   );
 }

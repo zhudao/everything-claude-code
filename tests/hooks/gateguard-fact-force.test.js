@@ -241,13 +241,7 @@ function runTests() {
       };
       const result = runHook(input, { GATEGUARD_STATE_DIR: invalidStateDir });
       assert.strictEqual(result.code, 0, 'exit code should be 0');
-      const output = parseOutput(result.stdout);
-      assert.ok(output, 'should produce valid JSON output');
-      if (output.hookSpecificOutput) {
-        assert.notStrictEqual(output.hookSpecificOutput.permissionDecision, 'deny', 'unpersistable state must not deny a retry that can never be recorded');
-      } else {
-        assert.strictEqual(output.tool_name, 'Write', 'pass-through should preserve input');
-      }
+      assert.strictEqual(result.stdout, '', 'fail-open result without an explicit decision must stay silent');
       assert.ok(result.stderr.includes('GateGuard state could not be persisted'), 'should warn that state persistence failed');
     })
   )
@@ -487,14 +481,7 @@ function runTests() {
       });
 
       assert.strictEqual(result.code, 0, 'exit code should be 0');
-      const output = parseOutput(result.stdout);
-      assert.ok(output, 'should produce valid JSON output');
-      if (output.hookSpecificOutput) {
-        assert.notStrictEqual(output.hookSpecificOutput.permissionDecision, 'deny', 'should not deny when hook is disabled');
-      } else {
-        // When disabled, hook passes through raw input
-        assert.strictEqual(output.tool_name, 'Edit', 'pass-through should preserve input');
-      }
+      assert.strictEqual(result.stdout, '', 'disabled wrapper hook must stay silent');
     })
   )
     passed++;
@@ -1859,6 +1846,87 @@ function runTests() {
   else failed++;
 
   if (
+    test('allows #2886 migration-doc heredoc repro with DROP TABLE prose', () => {
+      expectAllow(
+        [
+          "cat > migration-notes.md <<'EOF'",
+          "This migration will DROP TABLE old_sessions once we've verified nothing reads from it anymore.",
+          'EOF'
+        ].join('\n'),
+        'issue #2886 cat heredoc repro'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows destructive SQL prose inside a tee heredoc', () => {
+      expectAllow(
+        [
+          "tee migration-notes.md <<'EOF'",
+          'This migration will DROP TABLE old_sessions after verification.',
+          'EOF'
+        ].join('\n'),
+        'tee heredoc SQL prose'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows destructive rm prose inside a path-qualified cat heredoc', () => {
+      expectAllow(
+        [
+          "/bin/cat > notes.md <<'EOF'",
+          'Cleanup steps mention rm -rf old-cache; do not run yet.',
+          'EOF'
+        ].join('\n'),
+        'path-qualified cat heredoc prose'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows destructive prose inside a command-wrapped cat heredoc', () => {
+      expectAllow(
+        [
+          "command cat > notes.md <<'EOF'",
+          'Notes: DELETE FROM sessions; truncate staging.',
+          'EOF'
+        ].join('\n'),
+        'command-wrapped cat heredoc prose'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('still denies real destructive commands (not heredoc prose)', () => {
+      expectDestructiveDeny('rm -rf /tmp/real-destructive-target', 'real rm -rf');
+      expectDestructiveDeny('git reset --hard', 'real git reset --hard');
+      expectDestructiveDeny('drop table old_sessions', 'real drop table command text');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('fails closed when tee pipes heredoc payload into a shell', () => {
+      expectDestructiveDeny(
+        ['tee notes.md <<EOF | bash', 'rm -rf /tmp/tee-piped-shell-target', 'EOF'].join('\n'),
+        'tee piped to shell'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
     test('denies substitutions inside literal quote characters in an unquoted heredoc', () => {
       for (const payload of [
         "'$(rm -rf /tmp/expanded-target)'",
@@ -3099,6 +3167,93 @@ function runTests() {
           assert.strictEqual(output.tool_name, 'PowerShell');
         }
       }
+    })
+  )
+    passed++;
+  else failed++;
+
+  // --- Batch consistency (#3136): a parallel batch of edits to one ---
+  // not-yet-touched file partially applies: the first denial marks the
+  // file checked, so sibling edits in the same batch are allowed. Hooks
+  // see calls one at a time and cannot lock a batch, so the contract is
+  // that the denial itself names the file and warns that batch siblings
+  // may already have been applied.
+  clearState();
+  if (
+    test('first-touch Edit denial warns about applied batch siblings (#3136)', () => {
+      // Two edits to the same unchecked file, sent as a parallel batch.
+      // Each hook invocation is its own process, exactly as in a batch.
+      const editA = {
+        tool_name: 'Edit',
+        tool_input: { file_path: '/src/batch-target.js', old_string: 'a', new_string: 'b' }
+      };
+      const editB = {
+        tool_name: 'Edit',
+        tool_input: { file_path: '/src/batch-target.js', old_string: 'c', new_string: 'd' }
+      };
+
+      const first = parseOutput(runHook(editA).stdout);
+      assert.strictEqual(first.hookSpecificOutput.permissionDecision, 'deny', 'first edit of the batch is gated');
+      const firstReason = first.hookSpecificOutput.permissionDecisionReason;
+      assert.ok(firstReason.includes('/src/batch-target.js'), 'denial names the exact file');
+      assert.ok(
+        firstReason.includes('parallel batch'),
+        'denial warns that batch siblings may already have been applied'
+      );
+      assert.ok(
+        firstReason.includes('Re-read'),
+        'denial tells the agent to re-read the file before building on siblings'
+      );
+
+      // Sibling edit in the same batch: judged against post-denial state,
+      // so it applies. The warning above is what makes this visible.
+      const second = parseOutput(runHook(editB).stdout);
+      if (second && second.hookSpecificOutput) {
+        assert.notStrictEqual(second.hookSpecificOutput.permissionDecision, 'deny', 'batch sibling is not re-gated');
+      }
+    })
+  )
+    passed++;
+  else failed++;
+
+  clearState();
+  if (
+    test('condensed Edit denial also warns about applied batch siblings (#3136)', () => {
+      writeState({ checked: [], last_active: Date.now(), fact_force_denials: 3 });
+      const result = runHook({ tool_name: 'Edit', tool_input: { file_path: '/src/batch-condensed.js' } });
+      const output = parseOutput(result.stdout);
+      assert.strictEqual(output.hookSpecificOutput.permissionDecision, 'deny');
+      const reason = output.hookSpecificOutput.permissionDecisionReason;
+      assert.ok(reason.includes('parallel batch'), 'condensed denial keeps the batch-sibling warning');
+      assert.ok(!reason.includes('\n'), 'condensed denial stays a single line');
+    })
+  )
+    passed++;
+  else failed++;
+
+  clearState();
+  if (
+    test('first-touch Write and MultiEdit denials warn about applied batch siblings (#3136)', () => {
+      const writeOut = parseOutput(
+        runHook({ tool_name: 'Write', tool_input: { file_path: '/src/batch-new.js', content: 'x' } }).stdout
+      );
+      assert.strictEqual(writeOut.hookSpecificOutput.permissionDecision, 'deny');
+      assert.ok(
+        writeOut.hookSpecificOutput.permissionDecisionReason.includes('parallel batch'),
+        'Write denial carries the batch-sibling warning'
+      );
+
+      const multiOut = parseOutput(
+        runHook({
+          tool_name: 'MultiEdit',
+          tool_input: { edits: [{ file_path: '/src/batch-multi.js', old_string: 'a', new_string: 'b' }] }
+        }).stdout
+      );
+      assert.strictEqual(multiOut.hookSpecificOutput.permissionDecision, 'deny');
+      assert.ok(
+        multiOut.hookSpecificOutput.permissionDecisionReason.includes('parallel batch'),
+        'MultiEdit denial carries the batch-sibling warning'
+      );
     })
   )
     passed++;
