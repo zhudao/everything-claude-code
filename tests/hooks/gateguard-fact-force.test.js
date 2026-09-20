@@ -1978,12 +1978,71 @@ function runTests() {
   else failed++;
 
   if (
-    test('allows git push --force-if-includes as a safety-checked variant', () => {
-      expectAllow('git push --force-with-lease --force-if-includes origin main', 'git push --force-if-includes');
+    test('allows git push --force-if-includes as a safety-checked variant on a non-shared branch', () => {
+      expectAllow('git push --force-with-lease --force-if-includes origin feature-branch', 'git push --force-if-includes');
     })
   )
     passed++;
   else failed++;
+
+  // --- Ref- and history-destroying git commands (issues #3154, #3151) ---
+
+  const destructiveGitCases = [
+    ['git branch -D feature', 'git branch -D'],
+    ['git branch --delete --force feature', 'git branch --delete --force'],
+    ['git branch -d -f feature', 'git branch -d -f'],
+    ['git stash drop', 'git stash drop'],
+    ['git stash drop stash@{0}', 'git stash drop stash@{0}'],
+    ['git stash clear', 'git stash clear'],
+    ['git reflog expire --expire=now --all', 'git reflog expire'],
+    ['git reflog delete HEAD@{2}', 'git reflog delete'],
+    ['git update-ref -d refs/heads/x', 'git update-ref -d'],
+    ['git update-ref --delete refs/heads/x', 'git update-ref --delete'],
+    ['git restore foo.ts', 'git restore <path>'],
+    ['git restore .', 'git restore .'],
+    ['git restore --worktree foo.ts', 'git restore --worktree'],
+    ['git restore -W foo.ts', 'git restore -W'],
+    ['git restore --staged --worktree foo.ts', 'git restore --staged --worktree'],
+    ['git restore -s HEAD foo.ts', 'git restore --source without --staged'],
+    ['git push --force-with-lease origin main', 'git push --force-with-lease to main'],
+    ['git push --force-with-lease origin HEAD:main', 'git push --force-with-lease HEAD:main'],
+    ['git push --force-with-lease origin +refs/heads/master:refs/heads/master', 'git push --force-with-lease +refs/heads/master'],
+    ['git push --force-with-lease --force-if-includes origin main', 'git push --force-with-lease --force-if-includes to main'],
+    ['git push --force-with-lease --repo origin main', 'git push --force-with-lease --repo to main']
+  ];
+  for (const [command, label] of destructiveGitCases) {
+    if (
+      test(`denies ${label} as destructive`, () => {
+        expectDestructiveDeny(command, label);
+      })
+    )
+      passed++;
+    else failed++;
+  }
+
+  const safeGitCases = [
+    ['git branch -d feature', 'git branch -d (refuses when unmerged)'],
+    ['git branch -f feature', 'git branch -f (no delete)'],
+    ['git stash list', 'git stash list'],
+    ['git stash show', 'git stash show'],
+    ['git reflog show', 'git reflog show'],
+    ['git update-ref refs/heads/x abc1234', 'git update-ref without -d'],
+    ['git restore --staged foo.ts', 'git restore --staged'],
+    ['git restore -S foo.ts', 'git restore -S'],
+    ['git restore --source=HEAD --staged foo.ts', 'git restore --source with --staged'],
+    ['git push --force-with-lease origin feature-branch', 'git push --force-with-lease to feature branch'],
+    ['git push --force-with-lease', 'git push --force-with-lease with no refspec'],
+    ['git push --force-with-lease -o ci.skip origin feature-branch', 'git push --force-with-lease with push option']
+  ];
+  for (const [command, label] of safeGitCases) {
+    if (
+      test(`allows ${label}`, () => {
+        expectAllow(command, label);
+      })
+    )
+      passed++;
+    else failed++;
+  }
 
   // --- Review-round-2 findings ---
 
